@@ -232,6 +232,13 @@ def cmd_init(args):
     from .project_scanner import discover_entities
     from .room_detector_local import detect_rooms_local
 
+    # Honor --palace (issue #1313): without this, init silently ignored the
+    # flag and always used ~/.mempalace. Mirror the env-var pattern used by
+    # mcp_server.py so every downstream read of ``cfg.palace_path`` (Pass 0,
+    # cfg.init(), the post-init mine) routes to the user-specified location.
+    if getattr(args, "palace", None):
+        os.environ["MEMPALACE_PALACE_PATH"] = os.path.abspath(os.path.expanduser(args.palace))
+
     cfg = MempalaceConfig()
 
     # Resolve entity-detection languages: --lang overrides config.
@@ -310,8 +317,7 @@ def cmd_init(args):
                 )
         except LLMError as e:
             print(
-                f"  LLM init failed ({e}). "
-                f"Running heuristics-only — pass --no-llm to silence this."
+                f"  LLM init failed ({e}). Running heuristics-only — pass --no-llm to silence this."
             )
 
     # Pass 0: detect whether the corpus is AI-dialogue. Writes
@@ -646,6 +652,7 @@ def cmd_repair_status(args):
 def cmd_repair(args):
     """Rebuild palace vector index from SQLite metadata."""
     import shutil
+    from ._runtime import using_local_chroma
     from .backends.chroma import ChromaBackend
     from .migrate import confirm_destructive_action, contains_palace_database
     from .repair import TruncationDetected, check_extraction_safety
@@ -664,6 +671,19 @@ def cmd_repair(args):
             backup=getattr(args, "backup", True),
             dry_run=getattr(args, "dry_run", False),
             assume_yes=getattr(args, "yes", False),
+        )
+        return
+
+    # HTTP-mode rebuild delegates to repair.rebuild_index, which knows
+    # how to skip the sqlite cross-check, the file-system backup, and
+    # the recovery-from-backup branch. The CLI-level palace-dir backup
+    # below requires local filesystem access and so is local-only.
+    if not using_local_chroma():
+        from .repair import rebuild_index
+
+        rebuild_index(
+            palace_path=palace_path,
+            confirm_truncation_ok=getattr(args, "confirm_truncation_ok", False),
         )
         return
 
@@ -902,7 +922,7 @@ def cmd_compress(args):
     # Store compressed versions (unless dry-run)
     if not args.dry_run:
         try:
-            comp_col = backend.get_or_create_collection(palace_path, "mempalace_compressed")
+            comp_col = backend.get_or_create_collection(palace_path, "mempalace_closets")
             for doc_id, compressed, meta, stats in compressed_entries:
                 comp_meta = dict(meta)
                 comp_meta["compression_ratio"] = round(stats["size_ratio"], 1)
@@ -913,7 +933,7 @@ def cmd_compress(args):
                     metadatas=[comp_meta],
                 )
             print(
-                f"  Stored {len(compressed_entries)} compressed drawers in 'mempalace_compressed' collection."
+                f"  Stored {len(compressed_entries)} compressed drawers in 'mempalace_closets' collection."
             )
         except Exception as e:
             print(f"  Error storing compressed drawers: {e}")
