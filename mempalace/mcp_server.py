@@ -311,6 +311,36 @@ def _get_collection(create=False):
     global _collection_cache, _metadata_cache, _metadata_cache_time
     try:
         client = _get_client()
+
+        # HTTP mode: delegate to ``palace.get_collection`` so the
+        # collection-name namespace prefix (``HttpChromaBackend._qualify``)
+        # is applied. Without this, the MCP inventory tools
+        # (``list_wings`` / ``get_taxonomy`` / ``list_rooms`` /
+        # ``list_drawers`` / the KG-side ``status`` aggregate) call
+        # ``client.get_collection(_config.collection_name)`` on the bare
+        # name and read an empty / stale collection while the miner,
+        # searcher, and Stop-hook ingest path all write to the qualified
+        # ``<palace-namespace>__mempalace_drawers`` collection — under-
+        # reporting by orders of magnitude whenever multiple palaces
+        # share one chromadb server. ``client`` (above) stays useful in
+        # local mode for its inode/mtime-driven cache invalidation; in
+        # HTTP mode the call is purely for cache priming and the value
+        # is unused here.
+        from ._runtime import using_local_chroma  # noqa: PLC0415
+
+        if not using_local_chroma():
+            if _collection_cache is None or create:
+                from .palace import get_collection as _palace_get_collection  # noqa: PLC0415
+
+                _collection_cache = _palace_get_collection(
+                    _config.palace_path,
+                    collection_name=_config.collection_name,
+                    create=create,
+                )
+                _metadata_cache = None
+                _metadata_cache_time = 0
+            return _collection_cache
+
         # ChromaDB 1.x persists the EF *identity* (its ``name()``) with the
         # collection but not the EF *instance/configuration*. So a reader or
         # writer that omits ``embedding_function=`` silently gets chromadb's
