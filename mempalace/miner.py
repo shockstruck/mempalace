@@ -846,19 +846,27 @@ def process_file(
 
         # Batch chunks into bounded upserts so the embedding model sees many
         # chunks per forward pass without building one huge Chroma/SQLite
-        # request for pathological files. A bad chunk can fail its sub-batch;
-        # that is the deliberate trade-off for amortizing embedding overhead.
+        # request for pathological files. The byte-bounded slicer caps
+        # request body size as well as record count — without that cap, a
+        # source with a few oversized chunks (long log lines, embedded
+        # binaries that survive pre-filtering) can still produce a batch
+        # that the Chroma server rejects with ``Payload too large``.
+        # Both limits are env-overridable — see _drawer_upsert.iter_batches.
+        # A bad chunk can fail its sub-batch; that is the deliberate
+        # trade-off for amortizing embedding overhead.
         try:
             source_mtime = os.path.getmtime(source_file)
         except OSError:
             source_mtime = None
 
+        from ._drawer_upsert import iter_batches as _iter_drawer_batches  # noqa: PLC0415
+
         drawers_added = 0
-        for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
+        for batch_start, batch_end in _iter_drawer_batches(chunks):
             batch_docs: list = []
             batch_ids: list = []
             batch_metas: list = []
-            for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
+            for chunk in chunks[batch_start:batch_end]:
                 drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
                 batch_docs.append(chunk["content"])
                 batch_ids.append(drawer_id)

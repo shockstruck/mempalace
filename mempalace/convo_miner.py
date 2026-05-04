@@ -334,15 +334,24 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
             pass
 
         # Batch chunks into bounded upserts so large transcripts keep most of
-        # the embedding speedup without one huge Chroma/SQLite request. Keep
-        # one filed_at per source file so all transcript drawers share an
-        # ingest timestamp.
+        # the embedding speedup without one huge Chroma/SQLite request. The
+        # ``general`` extractor can produce single chunks of 50–100 KB when
+        # a chat exchange embeds a long code paste — pure record-count
+        # batching at 1000 records/batch then sends a 50–100 MB JSON body
+        # which Chroma rejects with ``Payload too large``. Switch to byte-
+        # bounded slicing (count-cap as ceiling) so byte-heavy batches
+        # flush early without slowing the small-chunk fast path. Both
+        # limits are env-overridable — see _drawer_upsert.iter_batches.
+        # Keep one filed_at per source file so all transcript drawers
+        # share an ingest timestamp.
+        from ._drawer_upsert import iter_batches as _iter_drawer_batches  # noqa: PLC0415
+
         filed_at = datetime.now().isoformat()
-        for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
+        for batch_start, batch_end in _iter_drawer_batches(chunks):
             batch_docs: list = []
             batch_ids: list = []
             batch_metas: list = []
-            for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
+            for chunk in chunks[batch_start:batch_end]:
                 chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
                 if extract_mode == "general":
                     room_counts_delta[chunk_room] += 1
