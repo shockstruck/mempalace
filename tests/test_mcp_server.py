@@ -324,6 +324,124 @@ class TestReadTools:
         assert "error" in result
 
 
+# ── HTTP-mode collection routing ────────────────────────────────────────
+
+
+class TestHttpModeCollectionRouting:
+    """Regression: in HTTP mode, ``_get_collection`` must delegate to
+    ``palace.get_collection`` so ``HttpChromaBackend._qualify`` applies the
+    namespace prefix.
+
+    Without this, the inventory tools (``list_wings`` / ``get_taxonomy`` /
+    ``list_rooms`` / ``list_drawers``) call ``client.get_collection`` on
+    the bare collection name and read an unrelated (or empty) collection
+    while the miner / searcher / Stop-hook ingest path all write to the
+    qualified ``<namespace>__mempalace_drawers`` collection. Discovered
+    in the wild after deploying mempalace-mcp-openvino against a shared
+    chromadb that hosts multiple palaces.
+    """
+
+    def test_get_collection_http_mode_delegates_to_palace_abstraction(
+        self, monkeypatch, config, kg
+    ):
+        from mempalace import mcp_server
+
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        # Force HTTP mode (using_local_chroma is imported inside the
+        # function via ``from ._runtime import using_local_chroma`` so
+        # the patch must target the source module).
+        import mempalace._runtime as _runtime
+
+        monkeypatch.setattr(_runtime, "using_local_chroma", lambda: False)
+
+        # Reset module caches so the HTTP branch actually runs.
+        monkeypatch.setattr(mcp_server, "_collection_cache", None)
+        monkeypatch.setattr(mcp_server, "_metadata_cache", None)
+        monkeypatch.setattr(mcp_server, "_metadata_cache_time", 0)
+
+        # Stub out ``_get_client`` — its return value is unused in the
+        # HTTP branch (cache priming only) and we don't want it to make
+        # a real HTTP connection during the test.
+        monkeypatch.setattr(mcp_server, "_get_client", lambda: object())
+
+        sentinel_collection = object()
+        observed_calls = []
+
+        def fake_palace_get_collection(palace_path, *, collection_name, create):
+            observed_calls.append(
+                {"palace_path": palace_path, "collection_name": collection_name, "create": create}
+            )
+            return sentinel_collection
+
+        import mempalace.palace as palace_module
+
+        monkeypatch.setattr(palace_module, "get_collection", fake_palace_get_collection)
+
+        result = mcp_server._get_collection(create=False)
+
+        assert result is sentinel_collection, (
+            "_get_collection must return the value from palace.get_collection"
+        )
+        assert len(observed_calls) == 1, (
+            f"palace.get_collection should be called exactly once, got {len(observed_calls)}"
+        )
+        call = observed_calls[0]
+        assert call["palace_path"] == config.palace_path
+        assert call["collection_name"] == config.collection_name
+        assert call["create"] is False
+
+    def test_get_collection_http_mode_does_not_call_client_get_collection(
+        self, monkeypatch, config, kg
+    ):
+        """In HTTP mode the bare ``client.get_collection(name)`` path must
+        be skipped entirely — that is the bypass that caused the
+        inventory-tools split-brain. The chromadb ``HttpClient`` returned
+        by ``_get_client`` should never have ``get_collection`` invoked
+        on it directly from ``_get_collection``."""
+        from mempalace import mcp_server
+
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        import mempalace._runtime as _runtime
+
+        monkeypatch.setattr(_runtime, "using_local_chroma", lambda: False)
+        monkeypatch.setattr(mcp_server, "_collection_cache", None)
+        monkeypatch.setattr(mcp_server, "_metadata_cache", None)
+        monkeypatch.setattr(mcp_server, "_metadata_cache_time", 0)
+
+        get_collection_calls = []
+
+        class _ExplodingClient:
+            def get_collection(self, *args, **kwargs):
+                get_collection_calls.append((args, kwargs))
+                raise AssertionError(
+                    "client.get_collection must not be called in HTTP mode"
+                )
+
+            def create_collection(self, *args, **kwargs):
+                raise AssertionError(
+                    "client.create_collection must not be called in HTTP mode"
+                )
+
+        monkeypatch.setattr(mcp_server, "_get_client", lambda: _ExplodingClient())
+
+        import mempalace.palace as palace_module
+
+        monkeypatch.setattr(
+            palace_module,
+            "get_collection",
+            lambda *a, **kw: object(),
+        )
+
+        # Should not raise — and the exploding client should never be
+        # asked for a collection.
+        mcp_server._get_collection(create=False)
+        assert get_collection_calls == [], (
+            "client.get_collection was called: HTTP path still bypasses palace.get_collection"
+        )
+
+
 # ── Search Tool ─────────────────────────────────────────────────────────
 
 
